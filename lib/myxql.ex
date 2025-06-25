@@ -23,6 +23,7 @@ defmodule MyXQL do
           | {:prepare, :force_named | :named | :unnamed}
           | {:disconnect_on_error_codes, [atom()]}
           | {:enable_cleartext_plugin, boolean()}
+          | {:local_infile, boolean()}
           | DBConnection.start_option()
 
   @type option() :: DBConnection.option()

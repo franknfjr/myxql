@@ -27,7 +27,8 @@ defmodule MyXQL.Client do
       :max_packet_size,
       :charset,
       :collation,
-      :enable_cleartext_plugin
+      :enable_cleartext_plugin,
+      :local_infile
     ]
 
     @sock_opts [mode: :binary, packet: :raw, active: false]
@@ -67,7 +68,8 @@ defmodule MyXQL.Client do
         socket_options: (opts[:socket_options] || []) ++ @sock_opts,
         charset: Keyword.get(opts, :charset),
         collation: Keyword.get(opts, :collation),
-        enable_cleartext_plugin: Keyword.get(opts, :enable_cleartext_plugin, false)
+        enable_cleartext_plugin: Keyword.get(opts, :enable_cleartext_plugin, false),
+        local_infile: Keyword.get(opts, :local_infile, false)
       }
     end
 
@@ -135,7 +137,41 @@ defmodule MyXQL.Client do
 
   def com_query(client, statement, result_state \\ :single) do
     with :ok <- send_com(client, {:com_query, statement}) do
-      recv_packets(client, &decode_com_query_response/3, :initial, result_state)
+      case recv_packets(client, &decode_com_query_response/3, :initial, result_state) do
+        {:ok, {:local_infile, filename}} ->
+          IO.puts("DEBUG: Got LOCAL INFILE request in com_query, handling...")
+
+          case handle_local_infile(client, filename) do
+            :ok ->
+              IO.puts("DEBUG: LOCAL INFILE content sent, waiting for response...")
+              recv_packets(client, &decode_com_query_response/3, :initial, result_state)
+            error ->
+              error
+          end
+
+        other ->
+          other
+      end
+    end
+  end
+
+  def handle_local_infile(client, filename) do
+    IO.puts("DEBUG: Handling LOCAL INFILE for: #{filename}")
+
+    case File.read(filename) do
+      {:ok, content} ->
+        IO.puts("DEBUG: File read successfully, size: #{byte_size(content)} bytes")
+
+        # Send file content with sequence number 2
+        with :ok <- send_packet(client, content, 2),
+             :ok <- send_packet(client, <<>>, 3) do
+          IO.puts("DEBUG: LOCAL INFILE completed with correct sequence numbers")
+          :ok
+        end
+
+      {:error, reason} ->
+        IO.puts("DEBUG: Error reading file: #{inspect(reason)}")
+        send_packet(client, <<>>, 2)
     end
   end
 
@@ -196,7 +232,10 @@ defmodule MyXQL.Client do
   end
 
   def send_data(%{sock: {sock_mod, sock}}, data) do
-    sock_mod.send(sock, data)
+    IO.puts("DEBUG send_data: sending #{IO.iodata_length(data)} bytes")
+    result = sock_mod.send(sock, data)
+    IO.puts("DEBUG send_data result: #{inspect(result)}")
+    result
   end
 
   def recv_packet(client, decoder, timeout \\ :infinity) do
@@ -216,7 +255,21 @@ defmodule MyXQL.Client do
   end
 
   def recv_data(%{sock: {sock_mod, sock}}, timeout) do
-    sock_mod.recv(sock, 0, timeout)
+    IO.puts("DEBUG recv_data: waiting for data, timeout=#{timeout}")
+    start_time = System.monotonic_time(:millisecond)
+    result = sock_mod.recv(sock, 0, timeout)
+    elapsed = System.monotonic_time(:millisecond) - start_time
+
+    case result do
+      {:ok, data} ->
+        IO.puts("DEBUG recv_data: received #{byte_size(data)} bytes in #{elapsed}ms")
+        IO.puts("DEBUG data_start: #{inspect(binary_part(data, 0, min(20, byte_size(data))))}")
+
+      {:error, reason} ->
+        IO.puts("DEBUG recv_data: error after #{elapsed}ms: #{inspect(reason)}")
+    end
+
+    result
   end
 
   ## Internals
@@ -255,17 +308,39 @@ defmodule MyXQL.Client do
          partial
        )
        when size < @default_max_packet_size do
+    IO.puts("DEBUG recv_packets normal: size=#{size}, decoder_state=#{inspect(decoder_state)}")
+    IO.puts("DEBUG payload_start: #{inspect(binary_part(payload, 0, min(10, size)))}")
+
     case decoder.(<<partial::binary, payload::binary>>, rest, decoder_state) do
       {:cont, decoder_state} ->
+        IO.puts("DEBUG decoder returned :cont, continuing...")
+
         recv_packets(rest, decoder, decoder_state, result_state, timeout, client)
 
       {:halt, result} ->
+        IO.puts("DEBUG decoder returned :halt, result=#{inspect(result)}")
+
         case result_state do
           :single -> {:ok, result}
           {:many, results} -> {:ok, [result | results]}
         end
 
+      {:local_infile, filename} ->
+        IO.puts("DEBUG: Handling LOCAL INFILE request for: #{filename}")
+
+        case handle_local_infile(client, filename) do
+          :ok ->
+            IO.puts("DEBUG: LOCAL INFILE content sent, waiting for final response...")
+            # Continuar recebendo a resposta final do servidor
+            recv_packets(rest, decoder, decoder_state, result_state, timeout, client)
+
+          {:error, reason} ->
+            IO.puts("DEBUG: LOCAL INFILE error: #{inspect(reason)}")
+            {:error, reason}
+        end
+
       {:error, _} = error ->
+        IO.puts("DEBUG decoder returned error: #{inspect(error)}")
         error
     end
   end
